@@ -1,0 +1,205 @@
+import io
+import json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+import streamlit as st
+
+# --- ML: CLIP zero-shot classification (PyTorch) ---
+import torch
+import open_clip
+from torchvision import transforms
+
+st.set_page_config(page_title="FoodCal • Photo to Calories", page_icon="🥗", layout="centered")
+
+# -------------------------
+# Nutrition DB (values per 100 g)
+# You can expand/edit these. Values are approximate.
+# -------------------------
+NUTRITION_DB = {
+    # Common Indian dishes
+    "butter chicken": {"kcal": 240, "protein_g": 14, "fat_g": 16, "carb_g": 10},
+    "chicken biryani": {"kcal": 180, "protein_g": 10, "fat_g": 6, "carb_g": 22},
+    "vegetable biryani": {"kcal": 160, "protein_g": 4, "fat_g": 5, "carb_g": 26},
+    "dal tadka": {"kcal": 120, "protein_g": 7, "fat_g": 4, "carb_g": 15},
+    "rajma": {"kcal": 125, "protein_g": 7, "fat_g": 1, "carb_g": 23},
+    "chole": {"kcal": 150, "protein_g": 7, "fat_g": 5, "carb_g": 20},
+    "palak paneer": {"kcal": 170, "protein_g": 10, "fat_g": 12, "carb_g": 6},
+    "paneer butter masala": {"kcal": 250, "protein_g": 8, "fat_g": 20, "carb_g": 10},
+    "masala dosa": {"kcal": 210, "protein_g": 5, "fat_g": 8, "carb_g": 30},
+    "idli sambar": {"kcal": 110, "protein_g": 4, "fat_g": 2, "carb_g": 20},
+    "medu vada": {"kcal": 265, "protein_g": 7, "fat_g": 15, "carb_g": 24},
+    "poha": {"kcal": 130, "protein_g": 3, "fat_g": 4, "carb_g": 22},
+    "upma": {"kcal": 155, "protein_g": 4, "fat_g": 6, "carb_g": 22},
+    "pav bhaji": {"kcal": 180, "protein_g": 4, "fat_g": 8, "carb_g": 24},
+    "samosa": {"kcal": 262, "protein_g": 5, "fat_g": 17, "carb_g": 22},
+    "aloo paratha": {"kcal": 220, "protein_g": 5, "fat_g": 8, "carb_g": 33},
+    "roti (chapati)": {"kcal": 110, "protein_g": 3, "fat_g": 2, "carb_g": 20},
+    "naan": {"kcal": 300, "protein_g": 9, "fat_g": 8, "carb_g": 48},
+    "jeera rice": {"kcal": 168, "protein_g": 3, "fat_g": 3, "carb_g": 32},
+    "curd rice": {"kcal": 135, "protein_g": 4, "fat_g": 3, "carb_g": 22},
+    "butter naan": {"kcal": 335, "protein_g": 9, "fat_g": 12, "carb_g": 48},
+    "fish curry": {"kcal": 140, "protein_g": 16, "fat_g": 7, "carb_g": 3},
+    "egg curry": {"kcal": 130, "protein_g": 9, "fat_g": 8, "carb_g": 5},
+    "khichdi": {"kcal": 120, "protein_g": 4, "fat_g": 3, "carb_g": 20},
+    "mutter paneer": {"kcal": 190, "protein_g": 10, "fat_g": 12, "carb_g": 10},
+    "kadhi": {"kcal": 110, "protein_g": 4, "fat_g": 6, "carb_g": 10},
+
+    # International/common dishes
+    "pizza (cheese)": {"kcal": 266, "protein_g": 11, "fat_g": 10, "carb_g": 33},
+    "burger": {"kcal": 250, "protein_g": 12, "fat_g": 9, "carb_g": 29},
+    "french fries": {"kcal": 312, "protein_g": 3, "fat_g": 15, "carb_g": 41},
+    "pasta (white sauce)": {"kcal": 190, "protein_g": 6, "fat_g": 8, "carb_g": 24},
+    "pasta (red sauce)": {"kcal": 150, "protein_g": 5, "fat_g": 3, "carb_g": 26},
+    "fried rice": {"kcal": 165, "protein_g": 4, "fat_g": 5, "carb_g": 26},
+    "noodles (veg)": {"kcal": 138, "protein_g": 4, "fat_g": 4, "carb_g": 21},
+    "salad (veg)": {"kcal": 70, "protein_g": 2, "fat_g": 3, "carb_g": 9},
+    "grilled chicken": {"kcal": 165, "protein_g": 31, "fat_g": 3.6, "carb_g": 0},
+    "omelette": {"kcal": 154, "protein_g": 11, "fat_g": 12, "carb_g": 1.5},
+    "pancakes": {"kcal": 227, "protein_g": 6, "fat_g": 9, "carb_g": 31},
+    "waffles": {"kcal": 291, "protein_g": 6, "fat_g": 14, "carb_g": 36},
+    "sandwich (veg)": {"kcal": 160, "protein_g": 5, "fat_g": 6, "carb_g": 22},
+    "sandwich (chicken)": {"kcal": 195, "protein_g": 12, "fat_g": 6, "carb_g": 22},
+    "sushi": {"kcal": 130, "protein_g": 7, "fat_g": 2, "carb_g": 24},
+    "ice cream (vanilla)": {"kcal": 207, "protein_g": 3.5, "fat_g": 11, "carb_g": 24},
+    "chocolate cake": {"kcal": 389, "protein_g": 5, "fat_g": 17, "carb_g": 55},
+}
+
+# A clean, user-friendly list of candidate dish names for CLIP zero-shot
+CANDIDATE_DISHES = list(NUTRITION_DB.keys())
+
+# -------------------------
+# CLIP helpers
+# -------------------------
+@st.cache_resource(show_spinner=False)
+def load_clip():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, _, preprocess = open_clip.create_model_and_transforms(
+        "ViT-B-32", pretrained="openai"
+    )
+    tokenizer = open_clip.get_tokenizer("ViT-B-32")
+    model.to(device).eval()
+    return model, preprocess, tokenizer, device
+
+def clip_predict(image: Image.Image, labels, model, preprocess, tokenizer, device, top_k=5):
+    img = preprocess(image).unsqueeze(0).to(device)
+
+    # Build text prompts
+    prompts = [f"a photo of {lbl}" for lbl in labels]
+    with torch.no_grad():
+        text = tokenizer(prompts).to(device)
+        image_features = model.encode_image(img)
+        text_features = model.encode_text(text)
+
+        # Normalize
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        # Similarity
+        logits_per_image = image_features @ text_features.t()
+        probs = logits_per_image.softmax(dim=-1).squeeze(0).detach().cpu().numpy()
+
+    # Top-k
+    idxs = np.argsort(probs)[::-1][:top_k]
+    return [(labels[i], float(probs[i])) for i in idxs]
+
+# -------------------------
+# Nutrition helpers
+# -------------------------
+def per_serving(nutr_per_100g: dict, grams: float) -> dict:
+    factor = grams / 100.0
+    return {
+        "Calories (kcal)": round(nutr_per_100g["kcal"] * factor, 1),
+        "Protein (g)": round(nutr_per_100g["protein_g"] * factor, 1),
+        "Fat (g)": round(nutr_per_100g["fat_g"] * factor, 1),
+        "Carbs (g)": round(nutr_per_100g["carb_g"] * factor, 1),
+    }
+
+def pie_chart(df_row):
+    import matplotlib.pyplot as plt
+
+    labels = ["Protein (g)", "Fat (g)", "Carbs (g)"]
+    values = [df_row["Protein (g)"], df_row["Fat (g)"], df_row["Carbs (g)"]]
+
+    fig, ax = plt.subplots()
+    ax.pie(values, labels=labels, autopct="%1.1f%%", startangle=90)
+    ax.axis("equal")
+    return fig
+
+# -------------------------
+# UI
+# -------------------------
+st.title("🥗 FoodCal — Photo → Calories & Macros")
+
+st.caption("Upload a food photo. We’ll predict the dish, let you confirm it, and estimate calories and macronutrients by portion size.")
+
+with st.sidebar:
+    st.header("⚙️ Settings")
+    default_portion = st.number_input("Default portion (grams)", 50, 1000, 250, 50)
+    st.markdown("---")
+    st.write("**Tip:** If prediction is off, pick the correct dish from the dropdown.")
+
+model, preprocess, tokenizer, device = load_clip()
+
+uploaded = st.file_uploader("Upload a food image (jpg/png)", type=["jpg", "jpeg", "png"])
+pred_choice = None
+topk = []
+
+if uploaded is not None:
+    image = Image.open(uploaded).convert("RGB")
+    st.image(image, caption="Uploaded photo", use_column_width=True)
+
+    with st.spinner("Analyzing image..."):
+        topk = clip_predict(image, CANDIDATE_DISHES, model, preprocess, tokenizer, device, top_k=5)
+
+    st.subheader("Predictions")
+    if topk:
+        df_pred = pd.DataFrame(
+            [{"Dish": name, "Confidence": round(p * 100, 1)} for name, p in topk]
+        )
+        st.dataframe(df_pred, use_container_width=True)
+        pred_choice = topk[0][0]
+    else:
+        st.info("Could not classify the image. Please pick a dish manually below.")
+
+# Dish selection (prediction default, fallback to first choice)
+st.subheader("Confirm / Change Dish")
+dish = st.selectbox("Detected dish (you can change):", options=CANDIDATE_DISHES, index=(CANDIDATE_DISHES.index(pred_choice) if pred_choice in CANDIDATE_DISHES else 0))
+
+portion = st.slider("Portion size (grams)", 50, 1000, default_portion, 25)
+
+# Compute nutrition
+nutr_row = NUTRITION_DB[dish]
+serving = per_serving(nutr_row, portion)
+
+st.markdown("### Estimated Nutrition")
+col1, col2 = st.columns([1, 1])
+with col1:
+    st.metric("Calories", f"{serving['Calories (kcal)']} kcal")
+    st.metric("Protein", f"{serving['Protein (g)']} g")
+with col2:
+    st.metric("Fat", f"{serving['Fat (g)']} g")
+    st.metric("Carbs", f"{serving['Carbs (g)']} g")
+
+st.markdown("#### Details")
+out_df = pd.DataFrame([{
+    "Dish": dish,
+    "Portion (g)": portion,
+    **serving
+}])
+st.dataframe(out_df, use_container_width=True)
+
+# Macro breakdown
+st.markdown("#### Macro Breakdown")
+fig = pie_chart(out_df.iloc[0])
+st.pyplot(fig, use_container_width=True)
+
+# Download report
+csv = out_df.to_csv(index=False).encode("utf-8")
+st.download_button("⬇️ Download CSV report", data=csv, file_name=f"{dish.replace(' ', '_')}_nutrition_{portion}g.csv", mime="text/csv")
+
+st.markdown("---")
+st.caption("Disclaimer: Estimates are approximate and based on typical recipes. Actual values vary by ingredients and preparation.")
